@@ -147,6 +147,52 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         advantages, returns = core_algos.compute_grpo_outcome_advantage(token_level_rewards=token_level_rewards,
                                                                         eos_mask=response_mask,
                                                                         index=index)
+        advantages = (advantages > 0).float()    
+        data.batch['advantages'] = advantages
+        data.batch['returns'] = returns
+    elif adv_estimator == 'optimal_token_baseline':
+        token_level_rewards = data.batch['token_level_rewards']
+        index = data.non_tensor_batch['uid']
+        responses = data.batch['responses']
+        response_length = responses.size(-1)
+        attention_mask = data.batch['attention_mask']
+        response_mask = attention_mask[:, -response_length:]
+        old_log_probs = data.batch["old_log_probs"]
+        sum_pi_squared = data.batch["sum_pi_squared"] 
+        advantages, returns = core_algos.compute_optimal_token_baseline_advantage(token_level_rewards=token_level_rewards,
+                                                                        response_mask=response_mask,
+                                                                        index=index,
+                                                                        old_log_probs=old_log_probs,
+                                                                        sum_pi_squared=sum_pi_squared)
+        data.batch['advantages'] = advantages
+        data.batch['returns'] = returns   
+    elif adv_estimator == 'tir_optimal_token_baseline':
+        token_level_rewards = data.batch['token_level_rewards']
+        index = data.non_tensor_batch['uid']
+        responses = data.batch['responses']
+        response_length = responses.size(-1)
+        attention_mask = data.batch['attention_mask']
+        response_mask = attention_mask[:, -response_length:]
+        old_log_probs = data.batch["old_log_probs"]
+        sum_pi_squared = data.batch["sum_pi_squared"] 
+        advantages, returns = core_algos.compute_multi_turn_optimal_token_baseline_advantage(token_level_rewards=token_level_rewards,
+                                                                        response_mask=response_mask,
+                                                                        index=index,
+                                                                        old_log_probs=old_log_probs,
+                                                                        sum_pi_squared=sum_pi_squared)
+        data.batch['advantages'] = advantages
+        data.batch['returns'] = returns   
+    elif adv_estimator == 'reinforce':
+        token_level_rewards = data.batch['token_level_rewards']
+        index = data.non_tensor_batch['uid']
+        responses = data.batch['responses']
+        response_length = responses.size(-1)
+        attention_mask = data.batch['attention_mask']
+        response_mask = attention_mask[:, -response_length:]
+        advantages, returns = core_algos.compute_grpo_outcome_advantage(token_level_rewards=token_level_rewards,
+                                                                        eos_mask=response_mask,
+                                                                        index=index)
+        advantages = (advantages > 0).float()                                                                
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
     else:
@@ -570,7 +616,7 @@ class RayPPOTrainer(object):
             self.resource_pool_to_cls[resource_pool]['critic'] = critic_cls
             self.use_critic = True
             
-        elif self.config.algorithm.adv_estimator == 'grpo':
+        elif self.config.algorithm.adv_estimator == 'grpo' or self.config.algorithm.adv_estimator == 'optimal_token_baseline' or self.config.algorithm.adv_estimator == 'tir_optimal_token_baseline' or self.config.algorithm.adv_estimator == 'reinforce':
             self.use_critic = False
         else:
             raise NotImplementedError
@@ -754,7 +800,6 @@ class RayPPOTrainer(object):
                     # Note that this breaks the order of data inside the batch.
                     # Please take care when you implement group based adv computation such as GRPO and rloo
                     self._balance_batch(batch, metrics=metrics)
-
                     # compute global_valid tokens
                     batch.meta_info['global_token_num'] = torch.sum(batch.batch['attention_mask'], dim=-1).tolist()
 

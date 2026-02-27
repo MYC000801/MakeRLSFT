@@ -400,32 +400,46 @@ class ActorRolloutRefWorker(Worker):
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def compute_log_prob(self, data: DataProto) -> DataProto:
         """mostly copying from generate_sequences"""
-        data = data.to('cuda')
+        data = data.to("cuda")
 
         assert self._is_rollout
         if self._is_offload_param:
-            load_fsdp_param_and_grad(module=self.actor_module_fsdp,
-                                     device_id=torch.cuda.current_device(),
-                                     load_grad=self._is_offload_grad)
+            load_fsdp_param_and_grad(
+                module=self.actor_module_fsdp,
+                device_id=torch.cuda.current_device(),
+                load_grad=self._is_offload_grad,
+            )
 
         data.batch = data.batch.cuda()
-        meta_info = {'eos_token_id': self.tokenizer.eos_token_id, 'pad_token_id': self.tokenizer.pad_token_id}
+        meta_info = {"eos_token_id": self.tokenizer.eos_token_id, "pad_token_id": self.tokenizer.pad_token_id}
         data.meta_info.update(meta_info)
+
 
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
-            old_log_probs = self.actor.compute_log_prob(data=data)
-            output = DataProto.from_dict(tensors={'old_log_probs': old_log_probs})
+
+            outputs = self.actor.compute_log_prob(data=data)  # now returns dict: log_probs/entropys/(sum_pi_squared)
+
+            tensors = {"old_log_probs": outputs["log_probs"], "entropys": outputs["entropys"]}
+            if "sum_pi_squared" in outputs:
+                tensors["sum_pi_squared"] = outputs["sum_pi_squared"]
+            if "log_probs_others" in outputs:
+                tensors["old_log_prob_others"] = outputs["log_probs_others"]
+            if "yprimes" in outputs:
+                tensors["yprimes"] = outputs["yprimes"]
+
+            output = DataProto.from_dict(tensors=tensors)
             output = self.ulysses_sharding_manager.postprocess_data(output)
-            
-        output = output.to('cpu')
+
+        output = output.to("cpu")
 
         if self._is_offload_param:
             # NOTE(sgm): the grad is already in CPU, only offload param here
             offload_fsdp_param_and_grad(module=self.actor_module_fsdp, offload_grad=self._is_offload_grad)
+
         # clear kv cache
         torch.cuda.empty_cache()
-        log_gpu_memory_usage('After recompute log prob', logger=logger)
+        log_gpu_memory_usage("After recompute log prob", logger=logger)
         return output
         
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
@@ -480,30 +494,42 @@ class ActorRolloutRefWorker(Worker):
     def compute_ref_log_prob(self, data: DataProto):
         assert self._is_ref
 
-        data = data.to('cuda')
+        data = data.to("cuda")
 
         if self._is_offload_param:
-            load_fsdp_param_and_grad(module=self.ref_module_fsdp,
-                                     device_id=torch.cuda.current_device(),
-                                     load_grad=self._is_offload_grad)
+            load_fsdp_param_and_grad(
+                module=self.ref_module_fsdp,
+                device_id=torch.cuda.current_device(),
+                load_grad=self._is_offload_grad,
+            )
 
         micro_batch_size = self.config.ref.log_prob_micro_batch_size
-        data.meta_info['micro_batch_size'] = micro_batch_size
-        data.meta_info['temperature'] = self.config.rollout.temperature
-        data.meta_info['max_token_len'] = self.config.ref.log_prob_max_token_len_per_gpu
-        data.meta_info['use_dynamic_bsz'] = self.config.ref.log_prob_use_dynamic_bsz
+        data.meta_info["micro_batch_size"] = micro_batch_size
+        data.meta_info["temperature"] = self.config.rollout.temperature
+        data.meta_info["max_token_len"] = self.config.ref.log_prob_max_token_len_per_gpu
+        data.meta_info["use_dynamic_bsz"] = self.config.ref.log_prob_use_dynamic_bsz
+
+
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
-            output = self.ref_policy.compute_log_prob(data=data)
-            output = DataProto.from_dict(tensors={'ref_log_prob': output})
+
+            outputs = self.ref_policy.compute_log_prob(data=data)  # now returns dict
+
+            tensors = {"ref_log_prob": outputs["log_probs"]}
+            if "sum_pi_squared" in outputs:
+                tensors["sum_pi_squared"] = outputs["sum_pi_squared"]
+
+            output = DataProto.from_dict(tensors=tensors)
             output = self.ulysses_sharding_manager.postprocess_data(output)
 
-        output = output.to('cpu')
+        output = output.to("cpu")
 
         if self._is_offload_param:
             offload_fsdp_param_and_grad(module=self.ref_module_fsdp, offload_grad=self._is_offload_grad)
+
         torch.cuda.empty_cache()
         return output
+
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def save_checkpoint(self, local_path, hdfs_path=None):
