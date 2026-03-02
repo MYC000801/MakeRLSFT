@@ -93,7 +93,7 @@ def compute_score_em(solution_str, ground_truth, method='strict', format_score=0
         score: the score for the correct answer
     """
     answer = extract_solution(solution_str=solution_str)
-    do_print = random.randint(1, 64) == 1
+    do_print = random.randint(1, 256) == 1
     
     if do_print:
         print(f"--------------------------------")

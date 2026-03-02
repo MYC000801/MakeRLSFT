@@ -143,6 +143,7 @@ def compute_policy_loss_positive_trans(
     w = w.clamp(max=w_clip_max)
 
     if weight_advantage:
+        print("checkkkk")
         adv_used = torch.where(use_other, (-advantages) * w, advantages)
     else:
         adv_used = torch.where(use_other, -advantages, advantages)

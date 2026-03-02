@@ -464,7 +464,7 @@ class DataParallelPPOActor(BasePPOActor):
         dataloader = batch.split(self.config.ppo_mini_batch_size)
 
         metrics = {}
-        for _, mini_batch in enumerate(dataloader):
+        for idx, mini_batch in enumerate(dataloader):
             if self.config.use_dynamic_bsz:
                 max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                 micro_batches, _ = rearrange_micro_batches(batch=mini_batch, max_token_len=max_token_len)
@@ -493,7 +493,7 @@ class DataParallelPPOActor(BasePPOActor):
                 log_prob = outputs["log_probs"]
                 entropy = outputs["entropys"]
 
-                if positive_transform:
+                if positive_transform and idx!=0:
                     old_log_prob_other = mb["old_log_prob_others"]
                     log_prob_other = outputs["log_probs_others"]
                     pg_loss, pg_clipfrac, w_clipfrac, ppo_kl = core_algos.compute_policy_loss_positive_trans(
@@ -539,7 +539,7 @@ class DataParallelPPOActor(BasePPOActor):
                     'actor/pg_clipfrac': pg_clipfrac.detach().item(),
                     'actor/ppo_kl': ppo_kl.detach().item(),
                 })
-                if positive_transform:
+                if positive_transform and idx!=0:
                     append_to_dict(metrics, {
                         'actor/w_clipfrac': w_clipfrac.detach().item(),
                     })                    
