@@ -106,6 +106,62 @@ def compute_gae_advantage_return(token_level_rewards: torch.Tensor, values: torc
         advantages = verl_F.masked_whiten(advantages, eos_mask)
     return advantages, returns
 
+def compute_policy_loss_grpo_asym_clip_gate(
+    old_log_prob_y: torch.Tensor,
+    log_prob_y: torch.Tensor,
+    old_log_prob_other: torch.Tensor,
+    log_prob_other: torch.Tensor,
+    advantages: torch.Tensor,
+    eos_mask: torch.Tensor,
+    cliprange: float,
+):
+    """
+    GRPO-style asymmetric clipping with hard gate.
+
+    If A >= 0:
+        y would-clip     if ratio_y > 1+eps
+        other would-clip if ratio_other < 1-eps
+
+    If A < 0:
+        y would-clip     if ratio_y < 1-eps
+        other would-clip if ratio_other > 1+eps
+
+    If either would-clip:
+        mask out ratio_y update (zero gradient).
+
+    Loss uses ratio_y only.
+    """
+
+    lo = 1.0 - cliprange
+    hi = 1.0 + cliprange
+
+    neg_approx_kl_y = log_prob_y - old_log_prob_y
+    neg_approx_kl_other = log_prob_other - old_log_prob_other
+
+    ratio_y = torch.exp(neg_approx_kl_y)
+    ratio_other = torch.exp(neg_approx_kl_other)
+
+    pos = advantages >= 0
+
+    # asymmetric one-sided clip condition
+    y_wouldclip = torch.where(pos, ratio_y > hi, ratio_y < lo)
+    other_wouldclip = torch.where(pos, ratio_other > hi, ratio_other < lo)
+
+    # hard gate
+    gate = ~(y_wouldclip | other_wouldclip)
+    gate = gate.float()   # non-differentiable mask
+
+    # y-only policy loss
+    pg_losses = -advantages * ratio_y * gate
+    pg_loss = verl_F.masked_mean(pg_losses, eos_mask)
+
+    # logging KL (y-only)
+    ppo_kl = verl_F.masked_mean(-neg_approx_kl_y, eos_mask)
+
+    # fraction of updates removed
+    pg_clipfrac = verl_F.masked_mean((1.0 - gate), eos_mask)
+
+    return pg_loss, pg_clipfrac, ppo_kl
 
 def compute_policy_loss_positive_trans(
     old_log_prob_y: torch.Tensor,
@@ -115,52 +171,49 @@ def compute_policy_loss_positive_trans(
     advantages: torch.Tensor,
     eos_mask: torch.Tensor,
     cliprange: float,
-    weight_advantage: True,
+    beta: float,
 ):
-    """
-    Positive-transform PPO loss:
-      - if A >= 0: use action y with advantage A
-      - if A <  0: sample y' from pi_old(·|s, exclude y), and optimize action y'
-                 with transformed positive advantage: (-A) * w
-                 where w = (1 - pi(y)) / pi(y)  (detached)
+    neg = (advantages < 0)
 
-    Notes:
-      - w is computed from CURRENT policy probability pi(y) via log_prob_y
-      - w is detached to avoid backprop through the reweighting term
-      - This returns the same outputs as compute_policy_loss
-    """
-    tiny = 1e-8
+    # ratios
+    r_y = torch.exp(log_prob_y - old_log_prob_y)
+    r_o = torch.exp(log_prob_other - old_log_prob_other)
+    if r_o.ndim == 2:
+        r_o = r_o.unsqueeze(-1)
+    elif r_o.ndim != 3:
+        raise ValueError(f"log_prob_other should be [B,R] or [B,R,K], got shape={tuple(log_prob_other.shape)}")
 
-    use_other = (advantages < 0)
+    # One-sided PPO-style clipping for A>=0 regime: only cap the upper side.
+    r_y_clip = torch.clamp(r_y, max=1.0 + cliprange)
+    p_y_old = torch.exp(old_log_prob_y.float())
+    one_minus_p_y_old = (-torch.expm1(old_log_prob_y.float())).clamp_min(1e-12)
+    neg_r_o_clip_upper = 1.0 + cliprange * (p_y_old / one_minus_p_y_old)
+    r_o_clip = torch.minimum(r_o, neg_r_o_clip_upper.unsqueeze(-1).to(r_o.dtype))
 
-    # pi(y) under current policy
-    p_y = torch.exp(log_prob_y).clamp(min=tiny, max=1.0 - tiny)
-
-    # weight for unbiased rewrite: (1-py)/py
-    w_clip_max = 10.0
-    w = ((1.0 - p_y) / p_y).detach()
+    # w = (1 - p_y_old) / p_y_old
+    # Use log-prob space for better stability and avoid direct probability clamp.
+    one_minus_p_y = one_minus_p_y_old
+    inv_p_y_old = torch.exp(-old_log_prob_y.float())
+    w_clip_max = 20.0
+    w = (one_minus_p_y * inv_p_y_old).detach()
     w_clipfrac = verl_F.masked_mean((w > w_clip_max).float(), eos_mask)
     w = w.clamp(max=w_clip_max)
 
-    if weight_advantage:
-        print("checkkkk")
-        adv_used = torch.where(use_other, (-advantages) * w, advantages)
-    else:
-        adv_used = torch.where(use_other, -advantages, advantages)
+    # default (positive samples): normal PPO
+    loss_tok = -advantages * r_y_clip
 
-    log_prob_used = torch.where(use_other, log_prob_other, log_prob_y)
-    old_log_prob_used = torch.where(use_other, old_log_prob_other, old_log_prob_y)
+    # negative samples: your mixed formula
+    other_term = (w.unsqueeze(-1) * r_o_clip).mean(dim=-1)
+    loss_neg = (-advantages) * beta * r_y_clip + advantages * (1.0 - beta) * other_term
 
-    negative_approx_kl = log_prob_used - old_log_prob_used
-    ratio = torch.exp(negative_approx_kl)
-    ppo_kl = verl_F.masked_mean(-negative_approx_kl, eos_mask)
+    loss_tok = torch.where(neg, loss_neg, loss_tok)
 
-    pg_losses = -adv_used * ratio
-    pg_losses2 = -adv_used * torch.clamp(ratio, 1.0 - cliprange, 1.0 + cliprange)
+    pg_loss = verl_F.masked_mean(loss_tok, eos_mask)
 
-    pg_loss = verl_F.masked_mean(torch.max(pg_losses, pg_losses2), eos_mask)
-    pg_clipfrac = verl_F.masked_mean((pg_losses2 > pg_losses).float(), eos_mask)
-    
+    pg_clipfrac = verl_F.masked_mean((r_y > 1.0 + cliprange).float(), eos_mask)
+
+    ppo_kl = verl_F.masked_mean(-(log_prob_y - old_log_prob_y), eos_mask)
+
     return pg_loss, pg_clipfrac, w_clipfrac, ppo_kl
 
 

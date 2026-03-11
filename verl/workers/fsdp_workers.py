@@ -418,11 +418,9 @@ class ActorRolloutRefWorker(Worker):
         with self.ulysses_sharding_manager:
             data = self.ulysses_sharding_manager.preprocess_data(data)
 
-            outputs = self.actor.compute_log_prob(data=data)  # now returns dict: log_probs/entropys/(sum_pi_squared)
+            outputs = self.actor.compute_log_prob(data=data)  # returns dict
 
             tensors = {"old_log_probs": outputs["log_probs"], "entropys": outputs["entropys"]}
-            if "sum_pi_squared" in outputs:
-                tensors["sum_pi_squared"] = outputs["sum_pi_squared"]
             if "log_probs_others" in outputs:
                 tensors["old_log_prob_others"] = outputs["log_probs_others"]
             if "yprimes" in outputs:
@@ -476,8 +474,12 @@ class ActorRolloutRefWorker(Worker):
             # perform recompute log_prob
             with self.ulysses_sharding_manager:
                 output = self.ulysses_sharding_manager.preprocess_data(output)
-                old_log_probs = self.actor.compute_log_prob(data=output)
-                output.batch['old_log_probs'] = old_log_probs
+                outputs = self.actor.compute_log_prob(data=output)
+                output.batch['old_log_probs'] = outputs["log_probs"]
+                if "log_probs_others" in outputs:
+                    output.batch["old_log_prob_others"] = outputs["log_probs_others"]
+                if "yprimes" in outputs:
+                    output.batch["yprimes"] = outputs["yprimes"]
                 output = self.ulysses_sharding_manager.postprocess_data(output)
 
         output = output.to('cpu')
@@ -516,8 +518,6 @@ class ActorRolloutRefWorker(Worker):
             outputs = self.ref_policy.compute_log_prob(data=data)  # now returns dict
 
             tensors = {"ref_log_prob": outputs["log_probs"]}
-            if "sum_pi_squared" in outputs:
-                tensors["sum_pi_squared"] = outputs["sum_pi_squared"]
 
             output = DataProto.from_dict(tensors=tensors)
             output = self.ulysses_sharding_manager.postprocess_data(output)

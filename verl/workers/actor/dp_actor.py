@@ -54,14 +54,6 @@ class DataParallelPPOActor(BasePPOActor):
         self.use_ulysses_sp = self.ulysses_sequence_parallel_size > 1
 
         self.compute_entropy_from_logits = torch.compile(verl_F.entropy_from_logits, dynamic=True)
-        # Sum of squared probabilities computation (for optimal_token_baseline)
-        # Only initialize if calculate_sum_pi_squared config is enabled
-        if self.config.get("calculate_sum_pi_squared", False):
-            self.calculate_sum_pi_squared_from_logits = (
-                torch.compile(verl_F.calculate_sum_pi_squared_from_logits, dynamic=True)
-                if self.config.get("use_torch_compile", True)
-                else verl_F.calculate_sum_pi_squared_from_logits
-            )
 
 
 
@@ -76,16 +68,13 @@ class DataParallelPPOActor(BasePPOActor):
             dict:
                 log_probs: (bs, response_len)
                 entropys: (bs, response_len)   # always computed/returned
-                log_probs_others: (bs, response_len) or None
-                yprimes: (bs, response_len) or None
-                if calculate_sum_pi_squared:
-                    sum_pi_squared: (bs, response_len)
+                log_probs_others: (bs, response_len) or (bs, response_len, k), optional
+                yprimes: (bs, response_len) or (bs, response_len, k), optional
         """
         import torch
 
-        calculate_sum_pi_squared = self.config.get("calculate_sum_pi_squared", False)
-        sum_pi_squared_checkpointing = self.config.get("sum_pi_squared_checkpointing", False)
         positive_transform = bool(self.config.get("positive_transform", False))
+        num_yprimes = max(1, int(self.config.get("positive_transform_num_yprimes", 1)))
 
         response_length = micro_batch["responses"].size(-1)
 
@@ -101,7 +90,6 @@ class DataParallelPPOActor(BasePPOActor):
                 response_mask = attention_mask[:, -response_length:]
 
             entropy = None
-            sum_pi_squared = None
             log_probs_others = None
             yprimes = None
 
@@ -163,15 +151,6 @@ class DataParallelPPOActor(BasePPOActor):
                 # entropy
                 entropy_rmpad = self.compute_entropy_from_logits(logits_rmpad)  # [nnz]
 
-                # optional sum_pi_squared
-                if calculate_sum_pi_squared:
-                    if not sum_pi_squared_checkpointing:
-                        sum_pi_squared_rmpad = self.calculate_sum_pi_squared_from_logits(logits_rmpad)
-                    else:
-                        sum_pi_squared_rmpad = torch.utils.checkpoint.checkpoint(
-                            self.calculate_sum_pi_squared_from_logits, logits_rmpad
-                        )
-
                 # positive_transform: compute / reuse yprimes + log_probs_others on response positions
                 if positive_transform:
                     logits_resp = logits_rmpad[response_logit_mask_rmpad]      # [Nresp, V]
@@ -180,18 +159,21 @@ class DataParallelPPOActor(BasePPOActor):
 
                     if V > 1 and logits_resp.numel() > 0:
                         if "yprimes" in micro_batch:
-                            # reuse provided yprimes [B,R] aligned with logits slice [-R-1:-1]
+                            # reuse provided yprimes [B,R] or [B,R,K], aligned with logits slice [-R-1:-1]
                             yprimes_br = micro_batch["yprimes"].to(device=input_ids.device, dtype=torch.long)
+                            if yprimes_br.ndim == 2:
+                                yprimes_br = yprimes_br.unsqueeze(-1)
+                            K = yprimes_br.size(-1)
 
                             yprime_pred_full = torch.zeros(
-                                batch_size, seqlen, device=input_ids.device, dtype=torch.long
+                                batch_size, seqlen, K, device=input_ids.device, dtype=torch.long
                             )
-                            yprime_pred_full[:, -response_length - 1 : -1] = yprimes_br
+                            yprime_pred_full[:, -response_length - 1 : -1, :] = yprimes_br
 
                             yprime_pred_rmpad = index_first_axis(
-                                rearrange(yprime_pred_full.unsqueeze(-1), "b s ... -> (b s) ..."),
+                                rearrange(yprime_pred_full, "b s k -> (b s) k"),
                                 indices
-                            ).squeeze(-1)  # [total_nnz]
+                            )  # [total_nnz, K]
 
                             if self.use_ulysses_sp:
                                 yprime_pred_rmpad, _, _ = ulysses_pad_and_slice_inputs(
@@ -199,7 +181,7 @@ class DataParallelPPOActor(BasePPOActor):
                                 )
                                 yprime_pred_rmpad = yprime_pred_rmpad.squeeze(0)
 
-                            yprime_resp = yprime_pred_rmpad[response_logit_mask_rmpad]  # [Nresp]
+                            yprime_resp = yprime_pred_rmpad[response_logit_mask_rmpad]  # [Nresp, K]
                         else:
                             probs = torch.softmax(logits_resp.float(), dim=-1)  # [Nresp, V]
                             probs.scatter_(1, y_resp.unsqueeze(1), 0.0)
@@ -210,16 +192,28 @@ class DataParallelPPOActor(BasePPOActor):
                                 probs[bad].scatter_(1, y_resp[bad].unsqueeze(1), 0.0)
                                 denom = probs.sum(dim=-1, keepdim=True)
                             probs = probs / denom.clamp_min(1e-12)
-                            yprime_resp = torch.multinomial(probs, num_samples=1).squeeze(1).to(dtype=torch.long)
+                            yprime_resp = torch.multinomial(
+                                probs, num_samples=num_yprimes, replacement=True
+                            ).to(dtype=torch.long)  # [Nresp, K]
 
-                        logp_other_resp = logprobs_from_logits(logits=logits_resp, labels=yprime_resp)  # [Nresp]
+                        Nresp = logits_resp.size(0)
+                        K = yprime_resp.size(-1)
+                        logits_resp_expanded = logits_resp.unsqueeze(1).expand(Nresp, K, V).reshape(-1, V)
+                        logp_other_resp = logprobs_from_logits(
+                            logits=logits_resp_expanded,
+                            labels=yprime_resp.reshape(-1),
+                        ).view(Nresp, K)  # [Nresp, K]
                     else:
-                        yprime_resp = y_resp.to(dtype=torch.long)
-                        logp_other_resp = torch.zeros_like(y_resp, dtype=log_probs_rmpad.dtype)
+                        K = num_yprimes
+                        yprime_resp = y_resp.to(dtype=torch.long).unsqueeze(-1).expand(-1, K)  # [Nresp, K]
+                        logp_other_resp = torch.zeros(
+                            yprime_resp.shape, device=logits_resp.device, dtype=log_probs_rmpad.dtype
+                        )
 
                     nnz = logits_rmpad.size(0)
-                    logp_other_rmpad = log_probs_rmpad.new_zeros((nnz,))
-                    yprime_rmpad = input_ids_rmpad_rolled.new_zeros((nnz,), dtype=torch.long)
+                    K = yprime_resp.size(-1)
+                    logp_other_rmpad = log_probs_rmpad.new_zeros((nnz, K))
+                    yprime_rmpad = input_ids_rmpad_rolled.new_zeros((nnz, K), dtype=torch.long)
                     logp_other_rmpad[response_logit_mask_rmpad] = logp_other_resp
                     yprime_rmpad[response_logit_mask_rmpad] = yprime_resp.to(dtype=torch.long)
 
@@ -238,11 +232,6 @@ class DataParallelPPOActor(BasePPOActor):
                         yprime_rmpad = gather_outpus_and_unpad(
                             yprime_rmpad, gather_dim=0, unpad_dim=0, padding_size=pad_size
                         )
-                    if calculate_sum_pi_squared:
-                        sum_pi_squared_rmpad = gather_outpus_and_unpad(
-                            sum_pi_squared_rmpad, gather_dim=0, unpad_dim=0, padding_size=pad_size
-                        )
-
                 # pad back to [B, seqlen]
                 full_entropy = pad_input(
                     hidden_states=entropy_rmpad.unsqueeze(-1),
@@ -262,28 +251,19 @@ class DataParallelPPOActor(BasePPOActor):
 
                 if positive_transform:
                     full_logp_other = pad_input(
-                        hidden_states=logp_other_rmpad.unsqueeze(-1),
+                        hidden_states=logp_other_rmpad,
                         indices=indices,
                         batch=batch_size,
                         seqlen=seqlen,
                     )
                     full_yprime = pad_input(
-                        hidden_states=yprime_rmpad.unsqueeze(-1),
+                        hidden_states=yprime_rmpad,
                         indices=indices,
                         batch=batch_size,
                         seqlen=seqlen,
                     )
-                    log_probs_others = full_logp_other.squeeze(-1)[:, -response_length - 1 : -1]  # [B, R]
-                    yprimes = full_yprime.squeeze(-1)[:, -response_length - 1 : -1]               # [B, R]
-
-                if calculate_sum_pi_squared:
-                    full_sum_pi_squared = pad_input(
-                        hidden_states=sum_pi_squared_rmpad.unsqueeze(-1),
-                        indices=indices,
-                        batch=batch_size,
-                        seqlen=seqlen,
-                    )
-                    sum_pi_squared = full_sum_pi_squared.squeeze(-1)[:, -response_length - 1 : -1]
+                    log_probs_others = full_logp_other[:, -response_length - 1 : -1, :]  # [B, R, K]
+                    yprimes = full_yprime[:, -response_length - 1 : -1, :]               # [B, R, K]
 
             else:
                 # dense path
@@ -306,7 +286,8 @@ class DataParallelPPOActor(BasePPOActor):
 
                     if "yprimes" in micro_batch:
                         yprimes = micro_batch["yprimes"].to(device=logits.device, dtype=y.dtype)
-                        log_probs_others = logprobs_from_logits(logits, yprimes)
+                        if yprimes.ndim == 2:
+                            yprimes = yprimes.unsqueeze(-1)
                     else:
                         if V > 1:
                             probs = torch.softmax(logits.float(), dim=-1)  # [B,R,V]
@@ -319,19 +300,22 @@ class DataParallelPPOActor(BasePPOActor):
                                 denom = probs.sum(dim=-1, keepdim=True)
                             probs = probs / denom.clamp_min(1e-12)
 
-                            yprimes = torch.multinomial(probs.view(-1, V), num_samples=1).view(B, R).to(dtype=y.dtype)
-                            log_probs_others = logprobs_from_logits(logits, yprimes)
+                            yprimes = torch.multinomial(
+                                probs.view(-1, V), num_samples=num_yprimes, replacement=True
+                            ).view(B, R, num_yprimes).to(dtype=y.dtype)
                         else:
-                            yprimes = y.clone()
-                            log_probs_others = torch.zeros_like(log_probs)
+                            yprimes = y.unsqueeze(-1).expand(B, R, num_yprimes).clone()
 
-                if calculate_sum_pi_squared:
-                    if not sum_pi_squared_checkpointing:
-                        sum_pi_squared = self.calculate_sum_pi_squared_from_logits(logits)
-                    else:
-                        sum_pi_squared = torch.utils.checkpoint.checkpoint(
-                            self.calculate_sum_pi_squared_from_logits, logits
-                        )
+                    K = yprimes.size(-1)
+                    logits_expanded = logits.unsqueeze(2).expand(B, R, K, V).reshape(-1, V)
+                    log_probs_others = logprobs_from_logits(
+                        logits_expanded,
+                        yprimes.reshape(-1),
+                    ).view(B, R, K)
+
+            if positive_transform and log_probs_others is not None and log_probs_others.dim() == 3 and log_probs_others.size(-1) == 1:
+                log_probs_others = log_probs_others.squeeze(-1)
+                yprimes = yprimes.squeeze(-1)
 
             outputs = {
                 "log_probs": log_probs,
@@ -339,8 +323,6 @@ class DataParallelPPOActor(BasePPOActor):
                 "log_probs_others": log_probs_others,
                 "yprimes": yprimes,
             }
-            if calculate_sum_pi_squared:
-                outputs["sum_pi_squared"] = sum_pi_squared
             return outputs
 
 
@@ -361,13 +343,11 @@ class DataParallelPPOActor(BasePPOActor):
             dict:
                 - log_probs: [B, R]
                 - entropys:  [B, R]
-                - sum_pi_squared: [B, R] (optional)
                 - log_probs_others: [B, R] (optional, if positive_transform)
                 - yprimes: [B, R] (optional, if positive_transform)
         """
         import itertools
 
-        calculate_sum_pi_squared = self.config.get("calculate_sum_pi_squared", False)
         positive_transform = bool(self.config.get("positive_transform", False))
 
         # set to eval
@@ -388,7 +368,6 @@ class DataParallelPPOActor(BasePPOActor):
 
         log_probs_lst = []
         entropys_lst = []
-        sum_pi_squared_lst = []
 
         # NEW: only if positive_transform
         log_probs_others_lst = []
@@ -398,20 +377,17 @@ class DataParallelPPOActor(BasePPOActor):
             with torch.no_grad():
                 outputs = self._forward_micro_batch(micro_batch, temperature=temperature, advantages=None)
 
-            log_probs_lst.append(outputs["log_probs"])
-            entropys_lst.append(outputs["entropys"])
-            if calculate_sum_pi_squared:
-                sum_pi_squared_lst.append(outputs["sum_pi_squared"])
+            # Keep recomputed log-prob tensors on CPU to reduce GPU memory pressure.
+            log_probs_lst.append(outputs["log_probs"].detach().to("cpu"))
+            entropys_lst.append(outputs["entropys"].detach().to("cpu"))
 
             if positive_transform:
-                # your _forward_micro_batch guarantees these are tensors when positive_transform=True
-                log_probs_others_lst.append(outputs["log_probs_others"])
-                yprimes_lst.append(outputs["yprimes"])
+                # Keep positive-transform aux tensors on CPU during accumulation to reduce GPU peak memory.
+                log_probs_others_lst.append(outputs["log_probs_others"].detach().to("cpu"))
+                yprimes_lst.append(outputs["yprimes"].detach().to("cpu"))
 
         log_probs = torch.concat(log_probs_lst, dim=0)
         entropys = torch.concat(entropys_lst, dim=0)
-        if calculate_sum_pi_squared:
-            sum_pi_squared = torch.concat(sum_pi_squared_lst, dim=0)
 
         if positive_transform:
             log_probs_others = torch.concat(log_probs_others_lst, dim=0)
@@ -424,15 +400,12 @@ class DataParallelPPOActor(BasePPOActor):
 
             log_probs = log_probs[revert_indices]
             entropys = entropys[revert_indices]
-            if calculate_sum_pi_squared:
-                sum_pi_squared = sum_pi_squared[revert_indices]
             if positive_transform:
-                log_probs_others = log_probs_others[revert_indices]
-                yprimes = yprimes[revert_indices]
+                revert_indices_cpu = revert_indices.to("cpu")
+                log_probs_others = log_probs_others[revert_indices_cpu]
+                yprimes = yprimes[revert_indices_cpu]
 
         outputs = {"log_probs": log_probs, "entropys": entropys}
-        if calculate_sum_pi_squared:
-            outputs["sum_pi_squared"] = sum_pi_squared
         if positive_transform:
             outputs["log_probs_others"] = log_probs_others
             outputs["yprimes"] = yprimes
@@ -488,13 +461,14 @@ class DataParallelPPOActor(BasePPOActor):
 
                 clip_ratio = self.config.clip_ratio
                 entropy_coeff = self.config.entropy_coeff
+                positive_transform_beta = float(self.config.get("positive_transform_beta", 0.0))
 
                 outputs = self._forward_micro_batch(micro_batch=mb, temperature=temperature, advantages=advantages)
                 log_prob = outputs["log_probs"]
                 entropy = outputs["entropys"]
 
                 if positive_transform and idx!=0:
-                    old_log_prob_other = mb["old_log_prob_others"]
+                    old_log_prob_other = mb["old_log_prob_others"].to(log_prob.device, non_blocking=True)
                     log_prob_other = outputs["log_probs_others"]
                     pg_loss, pg_clipfrac, w_clipfrac, ppo_kl = core_algos.compute_policy_loss_positive_trans(
                         old_log_prob_y=old_log_prob,
@@ -504,7 +478,7 @@ class DataParallelPPOActor(BasePPOActor):
                         advantages=advantages,
                         eos_mask=response_mask,
                         cliprange=clip_ratio,
-                        weight_advantage=bool(self.config.get("weight_advantage", True))
+                        beta=positive_transform_beta,
                     )
                 else:
                     pg_loss, pg_clipfrac, ppo_kl = core_algos.compute_policy_loss(

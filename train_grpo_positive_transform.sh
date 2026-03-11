@@ -1,7 +1,7 @@
 #!/bin/bash
 # Training script with Natural Gradient / Fisher Preconditioning enabled
 # Based on train_grpo.sh with natural gradient settings added
-export CUDA_VISIBLE_DEVICES=0,1
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 export DATA_DIR='data/nq_search'
 
 WAND_PROJECT='Search-R1'
@@ -16,7 +16,7 @@ WAND_PROJECT='Search-R1'
 # export EXPERIMENT_NAME=nq-search-r1-grpo-llama3.1-8b-it-em
 
 export BASE_MODEL='Qwen/Qwen2.5-3B-Instruct'
-export EXPERIMENT_NAME=nq-search-r1-otd-qwen2.5-3b-it-em-positive-transform-no-weight-clip-high
+export EXPERIMENT_NAME=nq-search-r1-otd-qwen2.5-3b-it-em-positive-transform-new-idea
 # export BASE_MODEL='Qwen/Qwen2.5-3B-Instruct'
 # export EXPERIMENT_NAME=nq-search-r1-grpo-qwen2.5-3b-it-em
 # export BASE_MODEL='Qwen/Qwen2.5-7B'
@@ -49,7 +49,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.285 \
     actor_rollout_ref.actor.use_kl_loss=true \
     actor_rollout_ref.actor.ppo_mini_batch_size=256 \
-    actor_rollout_ref.actor.ppo_micro_batch_size=32 \
+    actor_rollout_ref.actor.ppo_micro_batch_size=16 \
     actor_rollout_ref.actor.fsdp_config.param_offload=true \
     actor_rollout_ref.actor.fsdp_config.grad_offload=true \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=false \
@@ -66,12 +66,12 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.temperature=1 \
     actor_rollout_ref.actor.state_masking=true \
     +actor_rollout_ref.actor.positive_transform=true \
-    +actor_rollout_ref.actor.weight_advantage=true \
+    +actor_rollout_ref.actor.positive_transform_num_yprimes=10 \
     trainer.logger=['wandb'] \
     +trainer.val_only=false \
     +trainer.val_before_train=false \
     trainer.default_hdfs_dir=null \
-    trainer.n_gpus_per_node=2 \
+    trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \
     trainer.test_freq=50 \
