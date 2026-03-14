@@ -1,7 +1,7 @@
 #!/bin/bash
 # Training script with Natural Gradient / Fisher Preconditioning enabled
 # Based on train_grpo.sh with natural gradient settings added
-export CUDA_VISIBLE_DEVICES=0,1
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 export DATA_DIR='data/nq_search'
 
 WAND_PROJECT='Search-R1'
@@ -16,7 +16,7 @@ WAND_PROJECT='Search-R1'
 # export EXPERIMENT_NAME=nq-search-r1-grpo-llama3.1-8b-it-em
 
 export BASE_MODEL='Qwen/Qwen2.5-3B-Instruct'
-export EXPERIMENT_NAME=nq-search-r1-otd-qwen2.5-3b-it-em-positive-negative-transform-adaptive-clipping-1-times-
+export EXPERIMENT_NAME=nq-search-r1-otd-qwen2.5-3b-it-em-positive-negative-transform-adaptive-clipping-1-times
 # export BASE_MODEL='Qwen/Qwen2.5-3B-Instruct'
 # export EXPERIMENT_NAME=nq-search-r1-grpo-qwen2.5-3b-it-em
 # export BASE_MODEL='Qwen/Qwen2.5-7B'
@@ -71,7 +71,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     +trainer.val_only=false \
     +trainer.val_before_train=false \
     trainer.default_hdfs_dir=null \
-    trainer.n_gpus_per_node=2 \
+    trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
     trainer.save_freq=-1 \
     trainer.test_freq=50 \

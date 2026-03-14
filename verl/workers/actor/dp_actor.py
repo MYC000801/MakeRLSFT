@@ -467,10 +467,10 @@ class DataParallelPPOActor(BasePPOActor):
                 log_prob = outputs["log_probs"]
                 entropy = outputs["entropys"]
 
-                if positive_transform and idx!=0:
+                if positive_transform:
                     old_log_prob_other = mb["old_log_prob_others"].to(log_prob.device, non_blocking=True)
                     log_prob_other = outputs["log_probs_others"]
-                    pg_loss, pg_clipfrac, w_clipfrac, ppo_kl = core_algos.compute_policy_loss_positive_trans(
+                    pg_loss, pg_clipfrac, w_clipfrac, ppo_kl = core_algos.compute_policy_loss_positive_negative_trans(
                         old_log_prob_y=old_log_prob,
                         log_prob_y=log_prob,
                         old_log_prob_other=old_log_prob_other,
@@ -513,7 +513,7 @@ class DataParallelPPOActor(BasePPOActor):
                     'actor/pg_clipfrac': pg_clipfrac.detach().item(),
                     'actor/ppo_kl': ppo_kl.detach().item(),
                 })
-                if positive_transform and idx!=0:
+                if positive_transform:
                     append_to_dict(metrics, {
                         'actor/w_clipfrac': w_clipfrac.detach().item(),
                     })                    
